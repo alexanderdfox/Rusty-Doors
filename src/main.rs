@@ -1,32 +1,27 @@
-//! doors – Solaris/illumos Doors IPC re-created for Linux & macOS
+//! doors – Solaris/illumos Doors IPC + secure binary-reciprocal key/lock
 //!
-//! Single-file recreation inspired by:
-//!   https://github.com/robertdfrench/revolving-doors
-//! and structured like:
-//!   https://github.com/alexanderdfox/AIP
+//! Easy workflow:
+//!   doors keygen --out my.key          # create a strong key
+//!   doors server --key my.key          # start authenticated door
+//!   doors client --key my.key --auth   # authenticated call
 //!
-//! Core ideas preserved:
-//! - door_create  → register a handler that lives in a server process
-//! - fattach      → bind the door to a path (Unix domain socket)
-//! - door_call    → client RPC that looks like a local function call
-//! - automatic handler-thread (task) management
-//! - data in / data out (no descriptors in this minimal version)
-//!
-//! Usage:
-//!   # start server (keeps running)
-//!   ./doors server --path /tmp/hello.door
-//!
-//!   # client call
-//!   ./doors client --path /tmp/hello.door --msg "Hello, World!"
-//!
-//!   # concurrent clients (AIP-style max-jobs)
-//!   ./doors client --path /tmp/hello.door --msg "Hello" -m 8 -n 20
+//! The key is a large odd integer. Authentication uses the binary expansion
+//! of a challenge remainder divided by the key (period = ord_key(2)).
 
 use anyhow::{bail, Context, Result};
 use bytes::{BufMut, BytesMut};
 use clap::{Parser, Subcommand};
+use num_bigint::BigUint;
+use num_integer::Integer;
+use num_traits::{One, Zero};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,7 +30,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
 // ---------------------------------------------------------------------------
-// Wire protocol (simple length-prefixed JSON, mirrors door_arg_t data_ptr/size)
+// Wire protocol
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,19 +66,184 @@ async fn read_msg<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Resu
 }
 
 // ---------------------------------------------------------------------------
-// Server side  (door_create + fattach + automatic handler tasks)
+// Key material (the secret odd integer)
 // ---------------------------------------------------------------------------
 
-/// The “door procedure” – equivalent to the `answer` function in revolving-doors 80_hello_world.
-fn door_procedure(cookie: Option<&str>, args: &str) -> String {
-	// cookie can be used for per-door state (like the cookie argument in door_create)
-	let _ = cookie;
+#[derive(Clone)]
+struct Key {
+	n: BigUint,
+	bits: usize, // response length
+}
+
+impl Key {
+	/// Generate a strong new key (default 256-bit odd integer).
+	fn generate(bit_len: usize) -> Self {
+		let mut rng = rand::thread_rng();
+		let byte_len = (bit_len + 7) / 8;
+		let mut bytes = vec![0u8; byte_len];
+		loop {
+			rng.fill_bytes(&mut bytes);
+			// force odd and top bit set
+			bytes[0] |= 0x80;
+			*bytes.last_mut().unwrap() |= 1;
+			let n = BigUint::from_bytes_be(&bytes);
+			if !n.is_even() && n > BigUint::one() {
+				return Key {
+					n,
+					bits: 256, // secure default
+				};
+			}
+		}
+	}
+
+	/// Load from a key file (simple text format).
+	fn load(path: &Path) -> Result<Self> {
+		let content = fs::read_to_string(path)
+			.with_context(|| format!("read key file {}", path.display()))?;
+		let mut n_str = None;
+		let mut bits = 256usize;
+
+		for line in content.lines() {
+			let line = line.trim();
+			if line.is_empty() || line.starts_with('#') {
+				continue;
+			}
+			if let Some(v) = line.strip_prefix("n=") {
+				n_str = Some(v.trim());
+			} else if let Some(v) = line.strip_prefix("bits=") {
+				bits = v.trim().parse().context("bits=")?;
+			}
+		}
+
+		let n = BigUint::from_str(n_str.context("key file missing n=")?)
+			.context("invalid n in key file")?;
+		if n.is_even() || n <= BigUint::one() {
+			bail!("n must be odd and > 1");
+		}
+		Ok(Key { n, bits })
+	}
+
+	/// Save key with restrictive permissions (0600).
+	fn save(&self, path: &Path) -> Result<()> {
+		let mut f = OpenOptions::new()
+			.write(true)
+			.create(true)
+			.truncate(true)
+			.mode(0o600)
+			.open(path)
+			.with_context(|| format!("create key file {}", path.display()))?;
+
+		writeln!(f, "# doors binary-reciprocal key")?;
+		writeln!(f, "# keep this file secret")?;
+		writeln!(f, "n={}", self.n)?;
+		writeln!(f, "bits={}", self.bits)?;
+		Ok(())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Binary reciprocal primitives
+// ---------------------------------------------------------------------------
+
+fn binary_reciprocal_bits(n: &BigUint, mut rem: BigUint, bits: usize) -> (String, BigUint) {
+	debug_assert!(!n.is_even() && *n > BigUint::one());
+	let mut s = String::with_capacity(bits);
+	for _ in 0..bits {
+		rem <<= 1;
+		if &rem >= n {
+			s.push('1');
+			rem -= n;
+		} else {
+			s.push('0');
+		}
+	}
+	(s, rem)
+}
+
+fn ct_eq(a: &str, b: &str) -> bool {
+	if a.len() != b.len() {
+		return false;
+	}
+	let mut diff = 0u8;
+	for (x, y) in a.bytes().zip(b.bytes()) {
+		diff |= x ^ y;
+	}
+	diff == 0
+}
+
+/// Challenge remainder is bound to both the nonce and the key itself.
+fn challenge_remainder(key: &Key, nonce: &[u8]) -> BigUint {
+	let mut hasher = Sha256::new();
+	hasher.update(b"doors-chal-v1");
+	hasher.update(nonce);
+	hasher.update(key.n.to_bytes_be());
+	let hash = hasher.finalize();
+	let mut rem = BigUint::from_bytes_be(&hash);
+	rem %= &key.n;
+	if rem.is_zero() {
+		rem = BigUint::one();
+	}
+	rem
+}
+
+// ---------------------------------------------------------------------------
+// Door procedure (now takes a Key)
+// ---------------------------------------------------------------------------
+
+fn door_procedure(key: Option<&Key>, args: &str) -> String {
+	let Some(key) = key else {
+		// no key loaded → original unauthenticated behaviour
+		return format!("Well, hello to you too! You said: {}", args);
+	};
+
+	// Challenge
+	if let Some(nonce_hex) = args.strip_prefix("AUTH:CHAL:") {
+		let nonce = match hex::decode(nonce_hex.trim()) {
+			Ok(n) if n.len() >= 16 => n,
+			_ => return "AUTH:ERR:bad nonce".into(),
+		};
+		let r0 = challenge_remainder(key, &nonce);
+		return format!(
+			"AUTH:CHAL:{}:{}",
+			hex::encode(r0.to_bytes_be()),
+			key.bits
+		);
+	}
+
+	// Response
+	if let Some(rest) = args.strip_prefix("AUTH:RESP:") {
+		let parts: Vec<&str> = rest.splitn(2, ':').collect();
+		if parts.len() != 2 {
+			return "AUTH:ERR:malformed".into();
+		}
+		let nonce = match hex::decode(parts[0].trim()) {
+			Ok(n) if n.len() >= 16 => n,
+			_ => return "AUTH:ERR:bad nonce".into(),
+		};
+		let provided = parts[1].trim();
+
+		let r0 = challenge_remainder(key, &nonce);
+		let (expected, _) = binary_reciprocal_bits(&key.n, r0, key.bits);
+
+		if ct_eq(provided, &expected) {
+			return "AUTH:OK".into();
+		} else {
+			eprintln!("authentication failure from client");
+			return "AUTH:ERR:bad key".into();
+		}
+	}
+
+	// Unauthenticated message (still allowed)
 	format!("Well, hello to you too! You said: {}", args)
 }
 
-async fn handle_client(mut stream: UnixStream, cookie: Option<String>) -> Result<()> {
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+async fn handle_client(mut stream: UnixStream, key: Option<Key>) -> Result<()> {
 	let req: DoorRequest = read_msg(&mut stream).await?;
-	let reply = door_procedure(cookie.as_deref(), &req.data);
+	let reply = door_procedure(key.as_ref(), &req.data);
 	let resp = DoorResponse {
 		data: reply,
 		error: None,
@@ -92,21 +252,22 @@ async fn handle_client(mut stream: UnixStream, cookie: Option<String>) -> Result
 	Ok(())
 }
 
-async fn run_server(path: PathBuf, cookie: Option<String>) -> Result<()> {
-	// Clean up previous socket (fattach semantics)
+async fn run_server(path: PathBuf, key: Option<Key>) -> Result<()> {
 	let _ = tokio::fs::remove_file(&path).await;
-
 	let listener = UnixListener::bind(&path)
 		.with_context(|| format!("bind {}", path.display()))?;
 
-	println!("door attached at {} (sleeping forever, Ctrl-C to stop)", path.display());
+	if key.is_some() {
+		println!("door attached at {} (authenticated)", path.display());
+	} else {
+		println!("door attached at {} (unauthenticated)", path.display());
+	}
 
-	// Automatic handler-task management (mirrors door thread pool)
 	loop {
 		let (stream, _) = listener.accept().await?;
-		let cookie = cookie.clone();
+		let key = key.clone();
 		tokio::spawn(async move {
-			if let Err(e) = handle_client(stream, cookie).await {
+			if let Err(e) = handle_client(stream, key).await {
 				eprintln!("handler error: {:#}", e);
 			}
 		});
@@ -114,13 +275,52 @@ async fn run_server(path: PathBuf, cookie: Option<String>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Client side  (door_call)
+// Client auth helper
 // ---------------------------------------------------------------------------
 
-async fn door_call(path: &PathBuf, data: &str) -> Result<String> {
+async fn auth_handshake(path: &Path, key: &Key) -> Result<()> {
+	let mut nonce = [0u8; 32];
+	rand::thread_rng().fill_bytes(&mut nonce);
+	let nonce_hex = hex::encode(nonce);
+
+	let chal = door_call(path, &format!("AUTH:CHAL:{}", nonce_hex)).await?;
+	let parts: Vec<&str> = chal.trim().splitn(3, ':').collect();
+	if parts.len() < 3 || parts[0] != "AUTH" || parts[1] != "CHAL" {
+		bail!("server did not send a challenge: {}", chal);
+	}
+
+	let r0_hex = parts[2].split(':').next().unwrap_or("");
+	let r0 = BigUint::from_bytes_be(&hex::decode(r0_hex)?);
+	let bits: usize = parts[2]
+		.split(':')
+		.nth(1)
+		.and_then(|s| s.parse().ok())
+		.unwrap_or(key.bits);
+
+	let (bits_str, _) = binary_reciprocal_bits(&key.n, r0, bits);
+
+	let resp = door_call(
+		path,
+		&format!("AUTH:RESP:{}:{}", nonce_hex, bits_str),
+	)
+	.await?;
+
+	if resp.trim() == "AUTH:OK" {
+		println!("authenticated successfully");
+		Ok(())
+	} else {
+		bail!("authentication failed: {}", resp);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// door_call (unchanged API)
+// ---------------------------------------------------------------------------
+
+async fn door_call(path: &Path, data: &str) -> Result<String> {
 	let mut stream = UnixStream::connect(path)
 		.await
-		.with_context(|| format!("connect to door {}", path.display()))?;
+		.with_context(|| format!("connect to {}", path.display()))?;
 
 	let req = DoorRequest {
 		data: data.to_string(),
@@ -129,20 +329,28 @@ async fn door_call(path: &PathBuf, data: &str) -> Result<String> {
 
 	let resp: DoorResponse = read_msg(&mut stream).await?;
 	if let Some(err) = resp.error {
-		bail!("door returned error: {}", err);
+		bail!("door error: {}", err);
 	}
 	Ok(resp.data)
 }
 
 // ---------------------------------------------------------------------------
-// AIP-style concurrent client runner (max-jobs, event stream, aggregate status)
+// Concurrent runner (unchanged)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 enum Event {
 	Started { id: usize },
-	Finished { id: usize, output: String, error: Option<String> },
-	Status { running: usize, done: usize, queued: usize },
+	Finished {
+		id: usize,
+		output: String,
+		error: Option<String>,
+	},
+	Status {
+		running: usize,
+		done: usize,
+		queued: usize,
+	},
 }
 
 async fn run_clients(
@@ -157,7 +365,7 @@ async fn run_clients(
 	let running = Arc::new(AtomicUsize::new(0));
 	let failures = Arc::new(AtomicUsize::new(0));
 
-	let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(count);
+	let mut handles = Vec::with_capacity(count);
 
 	for id in 0..count {
 		let sem = sem.clone();
@@ -169,8 +377,8 @@ async fn run_clients(
 		let failures = failures.clone();
 		let total = count;
 
-		let h = tokio::spawn(async move {
-			let _permit = sem.acquire().await.expect("sem closed");
+		handles.push(tokio::spawn(async move {
+			let _permit = sem.acquire().await.expect("sem");
 			running.fetch_add(1, Ordering::SeqCst);
 			let _ = tx.send(Event::Started { id });
 			let _ = tx.send(Event::Status {
@@ -211,13 +419,11 @@ async fn run_clients(
 					.saturating_sub(running.load(Ordering::SeqCst))
 					.saturating_sub(done.load(Ordering::SeqCst)),
 			});
-		});
-		handles.push(h);
+		}));
 	}
 
-	drop(tx); // close channel when all tasks finish
+	drop(tx);
 
-	// Print events (LINE-mode style)
 	while let Some(ev) = rx.recv().await {
 		match ev {
 			Event::Started { id } => println!("[{}] started", id),
@@ -228,7 +434,11 @@ async fn run_clients(
 					println!("[{}] {}", id, output);
 				}
 			}
-			Event::Status { running, done, queued } => {
+			Event::Status {
+				running,
+				done,
+				queued,
+			} => {
 				eprintln!("status: running={} done={} queued={}", running, done, queued);
 			}
 		}
@@ -238,19 +448,22 @@ async fn run_clients(
 		let _ = h.await;
 	}
 
-	let fails = failures.load(Ordering::SeqCst);
-	Ok(if fails == 0 { 0 } else { 1 })
+	Ok(if failures.load(Ordering::SeqCst) == 0 {
+		0
+	} else {
+		1
+	})
 }
 
 // ---------------------------------------------------------------------------
-// CLI  (same shape as AIP)
+// CLI
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
 #[command(
 	name = "doors",
-	version = "0.1.0",
-	about = "Solaris Doors IPC re-created for Linux & macOS (single-file, AIP-style)"
+	version = "0.3.0",
+	about = "Solaris Doors IPC with easy binary-reciprocal key/lock"
 )]
 struct Args {
 	#[command(subcommand)]
@@ -259,34 +472,58 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-	/// Create a door and attach it to a path (server)
+	/// Generate a new strong key file
+	Keygen {
+		/// Output path for the key
+		#[arg(long, default_value = "doors.key")]
+		out: PathBuf,
+
+		/// Bit length of the secret (default 256)
+		#[arg(long, default_value_t = 256)]
+		bits: usize,
+	},
+
+	/// Start the door server
 	Server {
-		/// Path that will name the door (like fattach)
 		#[arg(long, default_value = "/tmp/hello.door")]
 		path: PathBuf,
 
-		/// Optional cookie (opaque state passed to the door procedure)
+		/// Path to key file (or set DOORS_KEY env)
 		#[arg(long)]
-		cookie: Option<String>,
+		key: Option<PathBuf>,
 	},
 
-	/// Call the door (client)
+	/// Call the door
 	Client {
 		#[arg(long, default_value = "/tmp/hello.door")]
 		path: PathBuf,
 
-		/// Data to send (door_arg_t.data_ptr)
 		#[arg(long, default_value = "Hello, World!")]
 		msg: String,
 
-		/// Number of concurrent calls (AIP-style)
 		#[arg(short = 'n', long, default_value_t = 1)]
 		count: usize,
 
-		/// Max concurrent jobs
 		#[arg(short = 'm', long, default_value_t = 8)]
 		max_jobs: usize,
+
+		/// Authenticate first
+		#[arg(long)]
+		auth: bool,
+
+		/// Path to key file (required with --auth, or set DOORS_KEY)
+		#[arg(long)]
+		key: Option<PathBuf>,
 	},
+}
+
+fn load_key(explicit: Option<PathBuf>) -> Result<Option<Key>> {
+	let path = explicit
+		.or_else(|| std::env::var_os("DOORS_KEY").map(PathBuf::from));
+	match path {
+		Some(p) => Ok(Some(Key::load(&p)?)),
+		None => Ok(None),
+	}
 }
 
 #[tokio::main]
@@ -294,17 +531,38 @@ async fn main() -> Result<()> {
 	let args = Args::parse();
 
 	match args.cmd {
-		Cmd::Server { path, cookie } => {
-			run_server(path, cookie).await?;
+		Cmd::Keygen { out, bits } => {
+			let key = Key::generate(bits);
+			key.save(&out)?;
+			println!("wrote key → {}", out.display());
+			println!("keep this file secret (mode 0600)");
 		}
+
+		Cmd::Server { path, key } => {
+			let key = load_key(key)?;
+			run_server(path, key).await?;
+		}
+
 		Cmd::Client {
 			path,
 			msg,
 			count,
 			max_jobs,
+			auth,
+			key,
 		} => {
-			let code = run_clients(path, msg, count, max_jobs).await?;
-			std::process::exit(code);
+			if auth {
+				let key = load_key(key)?.context("--auth requires a key (--key or DOORS_KEY)")?;
+				auth_handshake(&path, &key).await?;
+				// after successful auth we can still send a normal message
+				if !msg.is_empty() && msg != "Hello, World!" {
+					let reply = door_call(&path, &msg).await?;
+					println!("{}", reply);
+				}
+			} else {
+				let code = run_clients(path, msg, count, max_jobs).await?;
+				std::process::exit(code);
+			}
 		}
 	}
 	Ok(())
